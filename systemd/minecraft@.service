@@ -1,0 +1,60 @@
+# ═══════════════════════════════════════════════════════════════
+#  minecraft@.service — templated unit, one instance per server
+#
+#  Install:
+#    sudo cp minecraft@.service /etc/systemd/system/
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable --now minecraft@survival
+#
+#  Stop is routed through RCON rather than SIGTERM. Killing the JVM
+#  mid-chunk-write is how worlds get corrupted; "stop" lets Paper
+#  flush regions and player data first.
+# ═══════════════════════════════════════════════════════════════
+
+[Unit]
+Description=Minecraft Server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory=/opt/minecraft/%i
+
+# Give Paper time to save a large world before systemd escalates.
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=20s
+
+# Graceful shutdown via RCON; requires enable-rcon=true.
+ExecStop=/usr/local/bin/mcrcon -H 127.0.0.1 -P 25575 -p "${RCON_PASSWORD}" stop
+
+ExecStart=/opt/minecraft/%i/start.sh
+
+EnvironmentFile=-/etc/default/minecraft-%i
+
+# ── Hardening ──────────────────────────────────────────────────
+# A Minecraft server runs arbitrary plugin code, so it should not
+# have write access to anything outside its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/opt/minecraft/%i
+
+# The JVM opens a file handle per region file plus one per connection.
+LimitNOFILE=65536
+
+StandardOutput=append:/var/log/minecraft/%i.log
+StandardError=append:/var/log/minecraft/%i.log
+
+[Install]
+WantedBy=multi-user.target
