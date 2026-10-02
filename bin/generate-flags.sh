@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+#
+# generate-flags.sh — emit a tuned JVM command line for a Paper server
+#
+# Heap sizing and GC choice are not independent decisions, which is why
+# this is a script and not a copy-pasted one-liner:
+#
+#   * Xms is pinned equal to Xmx. A growing heap means the collector
+#     re-tunes its region sizing while the server is live, which shows
+#     up as tick spikes.
+#   * G1 is the default because its pause behaviour is predictable at
+#     the 4-12GB heaps most servers run. ZGC only becomes the better
+#     choice at larger heaps where G1 full-collection pauses get long.
+#   * Allocating most of the machine's RAM to the heap is a common and
+#     costly mistake: the JVM also needs metaspace, thread stacks and
+#     direct buffers, and the OS needs page cache for region files.
+#
+set -Eeuo pipefail
+
+readonly SCRIPT_NAME="${0##*/}"
+
+usage() {
+  cat <<'USAGE'
+Usage: generate-flags.sh [options]
+
+  -m, --memory <GB>     Heap size in gigabytes (default: auto)
+  -j, --jar <file>      Server jar (default: paper.jar)
+  -g, --gc <g1|zgc>     Collector (default: auto by heap size)
+  -a, --aikar           Force Aikar's G1 tuning regardless of heap
+  -o, --output <file>   Write a start script instead of printing
+  -h, --help            Show this help
+
+Examples:
+  generate-flags.sh -m 8
+  generate-flags.sh -m 24 -g zgc -o start.sh
+USAGE
+}
+
+log()  { printf '[%s] %s\n' "$SCRIPT_NAME" "$*" >&2; }
+die()  { log "error: $*"; exit 1; }
+
+# Total system memory in GB, rounded down.
+detect_total_memory_gb() {
+  local kb
+  kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  [[ "$kb" -gt 0 ]] || die "cannot read /proc/meminfo; pass --memory explicitly"
+  echo $(( kb / 1024 / 1024 ))
+}
+
+# Leave headroom for the OS, page cache and non-heap JVM memory.
+suggest_heap_gb() {
+  local total="$1"
+  if   (( total <= 4  )); then echo $(( total - 1 ))
+  elif (( total <= 8  )); then echo $(( total - 2 ))
+  elif (( total <= 16 )); then echo $(( total - 3 ))
+  else                         echo $(( total - 6 ))
+  fi
+}
+
+main() {
+  local memory_gb="" jar="paper.jar" gc="" force_aikar=0 output=""
+
+  while (( $# )); do
+    case "$1" in
+      -m|--memory) memory_gb="${2:-}"; shift 2 ;;
+      -j|--jar)    jar="${2:-}";       shift 2 ;;
+      -g|--gc)     gc="${2:-}";        shift 2 ;;
+      -o|--output) output="${2:-}";    shift 2 ;;
+      -a|--aikar)  force_aikar=1;      shift   ;;
+      -h|--help)   usage; exit 0 ;;
+      *)           die "unknown option: $1" ;;
+    esac
+  done
+
+  if [[ -z "$memory_gb" ]]; then
+    local total
+    total=$(detect_total_memory_gb)
+    memory_gb=$(suggest_heap_gb "$total")
+    log "detected ${total}GB total, allocating ${memory_gb}GB heap"
+  fi
+
+  [[ "$memory_gb" =~ ^[0-9]+$ ]] || die "memory must be an integer"
+  (( memory_gb >= 1 )) || die "memory must be at least 1GB"
+
+  if (( memory_gb > 31 )); then
+    # Above ~32GB the JVM drops compressed object pointers, so every
+    # reference widens from 4 to 8 bytes. A 31GB heap often holds more
+    # live objects than a 33GB one.
+    log "warning: heap >31GB disables compressed oops; 31GB is usually better"
+  fi
+
+  if [[ -z "$gc" ]]; then
+    if (( memory_gb >= 16 )) && (( force_aikar == 0 )); then gc="zgc"; else gc="g1"; fi
+    log "selected collector: $gc"
+  fi
+
+  local -a flags=(
+    "-Xms${memory_gb}G"
+    "-Xmx${memory_gb}G"
+    "-XX:+AlwaysPreTouch"
+    "-XX:+UnlockExperimentalVMOptions"
+    "-XX:+DisableExplicitGC"
+    "-XX:+PerfDisableSharedMem"
+  )
+
+  case "$gc" in
+    g1)
+      # Aikar's flags: a larger young generation and small G1 regions,
+      # tuned so most collections stay within a single tick.
+      flags+=(
+        "-XX:+UseG1GC"
+        "-XX:MaxGCPauseMillis=200"
+        "-XX:G1NewSizePercent=30"
+        "-XX:G1MaxNewSizePercent=40"
+        "-XX:G1HeapRegionSize=8M"
+        "-XX:G1ReservePercent=20"
+        "-XX:G1HeapWastePercent=5"
+        "-XX:G1MixedGCCountTarget=4"
+        "-XX:InitiatingHeapOccupancyPercent=15"
+        "-XX:G1MixedGCLiveThresholdPercent=90"
+        "-XX:G1RSetUpdatingPauseTimePercent=5"
+        "-XX:SurvivorRatio=32"
+        "-XX:MaxTenuringThreshold=1"
+      )
+      if (( memory_gb >= 12 )); then
+        flags+=("-XX:G1NewSizePercent=40" "-XX:G1MaxNewSizePercent=50")
+      fi
+      ;;
+    zgc)
+      # Generational ZGC keeps pauses sub-millisecond regardless of heap
+      # size, at the cost of higher CPU and memory overhead.
+      flags+=(
+        "-XX:+UseZGC"
+        "-XX:+ZGenerational"
+        "-XX:ZCollectionInterval=5"
+        "-XX:ZAllocationSpikeTolerance=2.0"
+        "-XX:+UseNUMA"
+      )
+      ;;
+    *) die "unsupported collector: $gc (expected g1 or zgc)" ;;
+  esac
+
+  flags+=(
+    "-Dusing.aikars.flags=https://mcflags.emc.gs"
+    "-Daikars.new.flags=true"
+    "-Dfile.encoding=UTF-8"
+    "-Djava.awt.headless=true"
+  )
+
+  local command_line="java ${flags[*]} -jar ${jar} nogui"
+
+  if [[ -n "$output" ]]; then
+    cat >"$output" <<EOF
+#!/usr/bin/env bash
+# Generated by ${SCRIPT_NAME} on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Heap: ${memory_gb}GB   Collector: ${gc}
+set -Eeuo pipefail
+cd "\$(dirname "\$0")"
+exec ${command_line}
+EOF
+    chmod +x "$output"
+    log "wrote $output"
+  else
+    printf '%s\n' "$command_line"
+  fi
+}
+
+main "$@"
